@@ -1,0 +1,17 @@
+#include <ArduinoIoTCloud.h>
+#include <Arduino_ConnectionHandler.h>
+
+// Replace with your Wi-Fi credentials
+const char SSID[]     = "Manoj Krishna iphone";
+const char PASS[]     = "manojkrishna";
+
+// Cloud variables
+float temperature;
+float humidity;
+
+void initProperties() {
+  ArduinoCloud.addProperty(temperature, READ, ON_CHANGE, NULL);
+  ArduinoCloud.addProperty(humidity, READ, ON_CHANGE, NULL);
+}
+
+WiFiConnectionHandler ArduinoIoTPreferredConnection(SSID, PASS);
