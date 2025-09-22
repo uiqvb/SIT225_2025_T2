@@ -1,0 +1,11 @@
+# 1. Go to your Week 7 redone project folder
+cd "C:\Users\Manit Khera\PycharmProjects\100 Days of Code - The Complete Python Pro Bootcamp\Week 7 redone"
+
+# 2. Activate your virtual environment
+.\.venv\Scripts\activate
+
+# 3. Install the required libraries
+pip install pandas numpy scikit-learn plotly kaleido
+
+# 4. Run your Python script
+python "python script.py"
