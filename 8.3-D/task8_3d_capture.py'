@@ -1,0 +1,366 @@
+# task8_3d_capture_and_dash.py
+# SIT225 8.3D — Smooth live Dash + 10s window saving with matched webcam image
+# Files saved to ./data 2/ as: 001_YYYYMMDDHHMMSS.csv/.png(or .html)/.jpg
+# Also appends to ./data 2/annotations.csv with: filename,label  (label left blank)
+
+from datetime import datetime, timedelta
+from pathlib import Path
+import threading
+import time
+import csv
+import re
+
+# 3rd party libs
+from arduino_iot_cloud import ArduinoCloudClient
+from iot_secrets import DEVICE_ID, SECRET_KEY
+from smoothdash import make_smooth_app
+from dash import html, dcc, Output, Input, no_update
+import plotly.graph_objects as go
+
+# Webcam (OpenCV). If unavailable, we degrade gracefully.
+try:
+    import cv2
+    OPENCV_OK = True
+except Exception:
+    OPENCV_OK = False
+
+# --------- User settings ---------
+VAR_X = "accelerometer_x"
+VAR_Y = "accelerometer_y"
+VAR_Z = "accelerometer_z"
+
+WINDOW_SEC = 10               # target window length for each saved pair
+MIN_SAMPLES_PER_WINDOW = 15   # lower so saves happen reliably
+OUTPUT_PREFIX = ""            # can keep empty; numbering is the main key
+HOST = "127.0.0.1"
+PORT = 8050
+
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = ROOT / "data 2"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+ANNOT_PATH = DATA_DIR / "annotations.csv"
+# ---------------------------------
+
+# ---------- Smooth Dash app ----------
+WINDOW_POINTS = 800
+MAX_APPEND = 20
+POLL_MS = 120
+
+app, state = make_smooth_app(
+    ["X", "Y", "Z"],
+    window_points=WINDOW_POINTS,
+    max_append=MAX_APPEND,
+    poll_ms=POLL_MS,
+)
+push = state["push"]
+
+# Serve files from ./data 2 so the browser can load latest JPG/PNG/HTML
+from flask import send_from_directory
+
+@app.server.route("/data2/<path:filename>")
+def _serve_data2(filename):
+    return send_from_directory(DATA_DIR, filename, as_attachment=False)
+
+# Extend layout with latest image + controls (IDs won't clash with smoothdash)
+_controls = html.Div([
+    html.Div([
+        html.Button("Force Save Now", id="force-save", n_clicks=0, style={"marginRight": "12px"}),
+        html.Span("Status: "),
+        html.Span(id="save-status", children="Waiting for data…"),
+        dcc.Interval(id="buf-peek", interval=3000, n_intervals=0)  # poll every 3s
+    ], style={"padding":"8px 12px", "borderTop":"1px solid #ddd", "marginTop":"8px"}),
+    html.Div([
+        html.H4("Latest window image"),
+        html.Img(id="latest-img", src="", style={"maxWidth":"100%", "border":"1px solid #eee", "borderRadius":"8px"})
+    ], style={"padding":"8px 12px"})
+])
+
+# Append controls to whatever layout smoothdash created
+if hasattr(app, "layout") and hasattr(app.layout, "children"):
+    app.layout.children = [*app.layout.children, _controls]
+else:
+    app.layout = html.Div([app.layout, _controls])
+
+# ---------- Data buffers & sync ----------
+latest = {"x": None, "y": None, "z": None}
+seen = {"x": False, "y": False, "z": False}
+lock = threading.Lock()
+
+# Window buffer (timestamp ISO, x, y, z)
+buf_lock = threading.Lock()
+buf_rows = []
+buf_start_ts = None  # datetime of first row in current window
+
+# Webcam
+_cam = None
+cam_lock = threading.Lock()
+
+def _open_cam():
+    """Open default webcam once; tolerate failures."""
+    global _cam
+    if _cam is not None:
+        return True
+    if not OPENCV_OK:
+        return False
+    try:
+        # CAP_DSHOW helps Windows start faster; fallback if missing
+        cam = cv2.VideoCapture(0, cv2.CAP_DSHOW) if hasattr(cv2, "CAP_DSHOW") else cv2.VideoCapture(0)
+        ok, _ = cam.read()
+        if not ok:
+            cam.release()
+            return False
+        _cam = cam
+        return True
+    except Exception:
+        return False
+
+def _close_cam():
+    global _cam
+    if _cam is not None:
+        _cam.release()
+        _cam = None
+
+def _ts_stamp(fmt="%Y%m%d%H%M%S"):
+    return datetime.now().strftime(fmt)
+
+def _iso_ms_now():
+    return datetime.now().isoformat(timespec="milliseconds")
+
+def _next_seq_number():
+    """
+    Scan existing CSVs in DATA_DIR like '001_YYYYMMDDHHMMSS.csv'
+    Return next seq as int.
+    """
+    pat = re.compile(r"^(\d{3})_\d{14}\.csv$")
+    max_seq = 0
+    for p in DATA_DIR.glob("*.csv"):
+        m = pat.match(p.name)
+        if m:
+            try:
+                s = int(m.group(1))
+                if s > max_seq:
+                    max_seq = s
+            except Exception:
+                pass
+    return max_seq + 1
+
+def _emit_if_ready_unlocked():
+    # lock must be held
+    if seen["x"] and seen["y"] and seen["z"]:
+        x, y, z = latest["x"], latest["y"], latest["z"]
+
+        # pretty string for UI graph
+        ts_hms = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        push(ts_hms, x, y, z)
+
+        # buffered row for saving
+        row = (_iso_ms_now(), x, y, z)
+        global buf_start_ts
+        with buf_lock:
+            if buf_start_ts is None:
+                buf_start_ts = datetime.now()
+            buf_rows.append(row)
+
+        # reset trio flags
+        seen["x"] = seen["y"] = seen["z"] = False
+
+def on_x(_client, v):
+    with lock:
+        latest["x"] = float(v) if v is not None else None
+        seen["x"] = True
+        _emit_if_ready_unlocked()
+
+def on_y(_client, v):
+    with lock:
+        latest["y"] = float(v) if v is not None else None
+        seen["y"] = True
+        _emit_if_ready_unlocked()
+
+def on_z(_client, v):
+    with lock:
+        latest["z"] = float(v) if v is not None else None
+        seen["z"] = True
+        _emit_if_ready_unlocked()
+
+def start_cloud_thread():
+    client = ArduinoCloudClient(device_id=DEVICE_ID, username=DEVICE_ID, password=SECRET_KEY)
+    client.register(VAR_X, value=None, on_write=on_x)
+    client.register(VAR_Y, value=None, on_write=on_y)
+    client.register(VAR_Z, value=None, on_write=on_z)
+
+    def run():
+        print("[Cloud] Connecting… keep Arduino IoT Remote in foreground with accelerometer ON.")
+        client.start()
+
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    return th
+
+# ---------- Saving helpers ----------
+def _save_csv(rows, base_path: Path) -> Path:
+    csv_path = base_path.with_suffix(".csv")
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["timestamp", "x", "y", "z"])
+        w.writerows(rows)
+    return csv_path
+
+def _save_plot(rows, base_path: Path):
+    # Build a figure for the saved window
+    ts = [r[0] for r in rows]
+    xs = [r[1] for r in rows]
+    ys = [r[2] for r in rows]
+    zs = [r[3] for r in rows]
+
+    fig = go.Figure()
+    fig.add_scatter(x=ts, y=xs, mode="lines", name="X")
+    fig.add_scatter(x=ts, y=ys, mode="lines", name="Y")
+    fig.add_scatter(x=ts, y=zs, mode="lines", name="Z")
+    fig.update_layout(
+        title=f"Accelerometer window — {base_path.stem}",
+        xaxis_title="time",
+        yaxis_title="accel",
+        margin=dict(l=40, r=20, t=50, b=40),
+        legend=dict(orientation="h", y=1.02, x=0),
+        template="plotly_white"
+    )
+
+    png_path = base_path.with_suffix(".png")
+    html_path = base_path.with_suffix(".html")
+    try:
+        # requires: pip install kaleido
+        fig.write_image(str(png_path), width=1200, height=500, scale=2)
+        return ("png", png_path)
+    except Exception:
+        fig.write_html(str(html_path), include_plotlyjs="cdn")
+        return ("html", html_path)
+
+def _save_image(base_path: Path) -> Path | None:
+    """Capture one webcam JPG into base_path.with_suffix('.jpg')"""
+    if not OPENCV_OK:
+        print("[Cam] OpenCV not installed; skipping image.")
+        return None
+    with cam_lock:
+        if not _open_cam():
+            print("[Cam] No webcam available; skipping image.")
+            return None
+        ok, frame = _cam.read()
+        if not ok or frame is None:
+            print("[Cam] Failed to read frame; skipping image.")
+            return None
+        jpg_path = base_path.with_suffix(".jpg")
+        cv2.imwrite(str(jpg_path), frame)
+        return jpg_path
+
+def _append_annotation_row(filename_stem: str, label: str = ""):
+    write_header = not ANNOT_PATH.exists()
+    with ANNOT_PATH.open("a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if write_header:
+            w.writerow(["filename", "label"])
+        w.writerow([filename_stem, label])
+
+def _flush_window(save_reason="auto"):
+    """
+    Save current buffer into CSV + plot + image with matched names.
+    Returns (status_msg, latest_image_path_or_None)
+    """
+    global buf_start_ts
+    with buf_lock:
+        n = len(buf_rows)
+        if n < MIN_SAMPLES_PER_WINDOW:
+            return f"[Save:{save_reason}] Skipped: only {n} samples (< {MIN_SAMPLES_PER_WINDOW}).", None
+        rows = buf_rows[:]
+        buf_rows.clear()
+        buf_start_ts = None
+
+    seq = _next_seq_number()
+    ts = _ts_stamp()  # YYYYMMDDHHMMSS
+    stem = f"{seq:03d}_{ts}"
+    base = DATA_DIR / (OUTPUT_PREFIX + stem)
+
+    csv_path = _save_csv(rows, base)
+    kind, art_path = _save_plot(rows, base)
+    img_path = _save_image(base)
+
+    _append_annotation_row(stem, label="")  # leave blank for later annotation
+
+    msg = f"[Save:{save_reason}] {len(rows)} samples | CSV -> {csv_path.name} | {kind.upper()} -> {art_path.name}"
+    if img_path:
+        msg += f" | IMG -> {img_path.name}"
+    else:
+        msg += " | IMG -> (skipped)"
+    print(msg)
+    return msg, img_path
+
+# ---------- Autosave thread ----------
+def start_autosave_thread():
+    def run():
+        while True:
+            time.sleep(1.0)
+            with buf_lock:
+                n = len(buf_rows)
+                start_ts = buf_start_ts
+            if start_ts is None or n == 0:
+                continue
+            if datetime.now() - start_ts >= timedelta(seconds=WINDOW_SEC):
+                _flush_window(save_reason="time")
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    return th
+
+# ---------- Dash callbacks ----------
+# Force Save: update the status text
+@app.callback(
+    Output("save-status", "children"),
+    Input("force-save", "n_clicks"),
+    prevent_initial_call=True
+)
+def cb_force_save(_n):
+    msg, _img = _flush_window(save_reason="manual")
+    return msg
+
+# Interval: update buffer status + newest image automatically
+@app.callback(
+    Output("save-status", "title"),
+    Output("latest-img", "src"),
+    Input("buf-peek", "n_intervals")
+)
+def cb_peek_and_latest(_i):
+    # show buffered rows + elapsed time
+    with buf_lock:
+        n = len(buf_rows)
+        started = buf_start_ts
+    if started:
+        elapsed = (datetime.now() - started).total_seconds()
+        status = f"Buffered: {n} rows | {elapsed:.1f}s"
+    else:
+        status = f"Buffered: {n} rows"
+
+    # find newest JPG (if any) and return a served URL with cache-buster
+    newest = None
+    try:
+        newest = max(DATA_DIR.glob("*.jpg"), key=lambda p: p.stat().st_mtime, default=None)
+    except Exception:
+        newest = None
+    if newest:
+        # add ?v=mtime to defeat browser caching
+        mtime = int(newest.stat().st_mtime)
+        img_src = f"/data2/{newest.name}?v={mtime}"
+    else:
+        img_src = no_update
+
+    return status, img_src
+
+# ---------- Main ----------
+if __name__ == "__main__":
+    try:
+        print(f"[Init] Output dir: {DATA_DIR}")
+        if not OPENCV_OK:
+            print("[Warn] OpenCV not installed. Install with: pip install opencv-python")
+        start_cloud_thread()
+        start_autosave_thread()
+        print(f"[Run] Dash at http://{HOST}:{PORT}")
+        app.run(debug=False, host=HOST, port=PORT)
+    finally:
+        _close_cam()
