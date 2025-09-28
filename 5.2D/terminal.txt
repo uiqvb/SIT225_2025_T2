@@ -1,0 +1,39 @@
+cd "5.2D redone"
+
+# --- Create virtual environment ---
+py -m venv venv
+
+# --- Activate it ---
+# Run this in PowerShell or CMD:
+venv\Scripts\activate
+
+# --- Upgrade pip ---
+py -m pip install --upgrade pip
+
+# --- Install required libraries ---
+pip install paho-mqtt pymongo
+
+pip install redis
+
+# (Optional: for later CSV + graphing)
+pip install pandas matplotlib
+
+# --- Run your subscriber ---
+py subscriber.py
+
+cd "C:\Users\Manit Khera\PycharmProjects\100 Days of Code - The Complete Python Pro Bootcamp\5.2D redone"
+venv\Scripts\activate
+venv\Scripts\python.exe subscriber.py
+
+SUBSCIBER
+cd "C:\Users\Manit Khera\PycharmProjects\100 Days of Code - The Complete Python Pro Bootcamp\5.2D redone"
+venv\Scripts\activate
+venv\Scripts\python.exe subscriber.py
+LIVE PLOTTER
+cd "C:\Users\Manit Khera\PycharmProjects\100 Days of Code - The Complete Python Pro Bootcamp\5.2D redone"
+venv\Scripts\activate
+venv\Scripts\python.exe live_plot.py
+PLOT HISTORY
+cd "C:\Users\Manit Khera\PycharmProjects\100 Days of Code - The Complete Python Pro Bootcamp\5.2D redone"
+venv\Scripts\activate
+venv\Scripts\python.exe plot_history.py
