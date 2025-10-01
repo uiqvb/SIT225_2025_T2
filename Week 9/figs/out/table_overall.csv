@@ -1,0 +1,5 @@
+metric,value
+Events,10.0
+Avg duration (s),17.5
+Median duration (s),20.0
+>=20s compliance (%),50.0
